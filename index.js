@@ -44,6 +44,10 @@ module.exports = multipart
 
 function multipart (options) {
   options = options || {};
+  // Use default max size of 100 MB for all files combined, roughly matching the default
+  // multipart request size limit of 100 MiB in Express 3 / connect@2.30.2:
+  // https://github.com/senchalabs/connect/blob/2.30.2/lib/middleware/multipart.js#L86
+  options.maxFilesSize = options.maxFilesSize || 100 * 1000 * 1000;
 
   return function multipart(req, res, next) {
     if (req._body) return next();
@@ -108,8 +112,14 @@ function multipart (options) {
       done = true;
 
       // expand names with qs & assign
-      req.body = qs.parse(data, { allowDots: true })
-      req.files = qs.parse(files, { allowDots: true })
+      // Note: `allowDots: false, allowPrototypes: true` come from Express 3 / connect@2.30.2:
+      // https://github.com/senchalabs/connect/blob/2.30.2/lib/middleware/multipart.js#L148-L149
+      req.body = qs.parse(data, { allowDots: false, allowPrototypes: true })
+      /**
+       * Dictionary of field name to FileInfo
+       * @type {{[fieldName: string]: FileInfo}}
+       */
+      req.files = qs.parse(files, { allowDots: false, allowPrototypes: true })
 
       next()
     });
@@ -117,3 +127,14 @@ function multipart (options) {
     form.parse(req);
   }
 };
+
+/**
+ * @typedef {object} FileInfo - Uploaded file from a multipart form
+ *
+ * @property {string} name - original filename, from user's system
+ * @property {string} originalFilename - original filename, from user's system
+ * @property {string} type - content-type of the file, from user's browser
+ * @property {number} size - size of the file in bytes
+ * @property {string} path - local filesystem path to uploaded file
+ * @property {string} fieldName - name of the form field 
+ */
