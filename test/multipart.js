@@ -227,6 +227,48 @@ describe('multipart()', function(){
       .end(done)
     })
 
+    it('still routes text fields to req.body alongside file parts', function (done) {
+      var seenStorageFilenames = []
+      var opts = {
+        storage: function (req, part, publicFile, cb) {
+          seenStorageFilenames.push(part.filename)
+          part.resume()
+          part.on('end', function () {
+            publicFile.path = '/tmp/' + part.filename
+            publicFile.size = 0
+            cb()
+          })
+        }
+      }
+
+      // The combined endpoint echoes both body and files so we can assert each.
+      var app = connect()
+        .use(multipart(opts))
+        .use(function (req, res) {
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.end(JSON.stringify({ body: req.body, files: req.files }))
+        })
+        .use(function (err, req, res, next) {
+          res.statusCode = err.statusCode || err.status || 500
+          res.end(err.name + ': ' + err.message)
+        })
+
+      request(app)
+        .post('/combined')
+        .field('user', 'Tobi')
+        .attach('resume', Buffer.from('hello'), 'cv.pdf')
+        .expect(200)
+        .expect(shouldDeepIncludeInBody({
+          body: { user: 'Tobi' },
+          files: { resume: { name: 'cv.pdf', path: '/tmp/cv.pdf' } }
+        }))
+        .end(function (err) {
+          if (err) return done(err)
+          should(seenStorageFilenames).eql(['cv.pdf']) // storage only sees the file part
+          done()
+        })
+    })
+
     it('waits for async storage callbacks before calling next()', function (done) {
       var opts = {
         storage: function (req, part, publicFile, cb) {

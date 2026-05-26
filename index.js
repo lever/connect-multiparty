@@ -50,8 +50,11 @@ module.exports = multipart
  *         // publicFile: pre-populated {fieldName, originalFilename, name, type, headers, size: 0}
  *         //             — the storage function should fill in publicFile.path and publicFile.size
  *         //             before calling cb().
- *         // cb(err) → on err the storage is expected to have destroyed the part stream;
- *         //          connect-multiparty will surface a 400 to the route via next(err).
+ *         // cb(err) → on err the storage should destroy(part) for resource hygiene
+ *         //          (stop reading the network) and call cb(err). connect-multiparty
+ *         //          then drains the request and surfaces 400 via next(err); it is
+ *         //          form.emit('error') that releases the parser, not destroying the
+ *         //          part stream.
  *       }
  *     }))
  *
@@ -59,6 +62,16 @@ module.exports = multipart
  * and either pipe the rest to disk (no fs.createWriteStream until validation passes)
  * or destroy(part) and call cb(err). This is the same StorageEngine model multer 1.x
  * exposes.
+ *
+ * ### Size limit caveat
+ *
+ * `options.maxFilesSize` (default 100 MB) is enforced by multiparty INSIDE its
+ * built-in handleFile via a LimitStream. With `options.storage` set, multiparty
+ * routes file parts to handlePart instead — no LimitStream is inserted. **When you
+ * provide a storage engine, enforcing a per-request/per-file size cap becomes the
+ * storage engine's responsibility** (e.g. via a multer-style `limits.fileSize` or
+ * a counter inside the part 'data' handler). The middleware will not warn if the
+ * cap is silently bypassed.
  *
  * @param {Object} options
  * @return {Function}
@@ -141,9 +154,12 @@ function multipart (options) {
 
     if (typeof storage === 'function') {
       form.on('part', function(part) {
-        // Non-file parts can fall through to 'field' handling above; defend against
-        // odd multipart payloads with no filename by draining the stream.
-        if (!part.filename) {
+        // Drop any parts that arrive after the request has already finished (either
+        // via an error from a previous part's storage callback, or after a successful
+        // finishParse). Multiparty keeps parsing buffered parts even after we've
+        // signaled completion to express; without this guard we'd kick off new
+        // storage work whose results have nowhere to go.
+        if (done) {
           part.resume();
           return;
         }
@@ -163,8 +179,9 @@ function multipart (options) {
         storage(req, part, publicFile, function (err) {
           pendingStorage--;
           if (err) {
-            // The storage engine is responsible for destroying the part stream before
-            // calling back with an error, so the upstream multipart parser releases.
+            // The storage engine should destroy(part) for resource hygiene; it is
+            // form.emit('error') below that actually releases the parser and drives
+            // the 400 response.
             form.emit('error', err);
             return;
           }
