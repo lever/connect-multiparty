@@ -213,6 +213,11 @@ describe('multipart()', function(){
     it('rejects the request when the storage engine errors', function (done) {
       var opts = {
         storage: function (req, part, publicFile, cb) {
+          // Storage engines should attach part.on('error') for graceful cleanup of
+          // any in-flight write streams or partial state. The wrapper attaches a
+          // no-op default to prevent crashes from forgetful engines, but real
+          // engines want to know.
+          part.on('error', cb)
           part.resume() // drain so multiparty can finish parsing the boundary
           part.on('end', function () {
             cb(new Error('rejected by storage'))
@@ -231,6 +236,7 @@ describe('multipart()', function(){
       var seenStorageFilenames = []
       var opts = {
         storage: function (req, part, publicFile, cb) {
+          part.on('error', cb)
           seenStorageFilenames.push(part.filename)
           part.resume()
           part.on('end', function () {
@@ -272,6 +278,7 @@ describe('multipart()', function(){
     it('waits for async storage callbacks before calling next()', function (done) {
       var opts = {
         storage: function (req, part, publicFile, cb) {
+          part.on('error', cb)
           part.resume()
           part.on('end', function () {
             // Simulate a slow flush (write stream finish, S3 upload, etc.)
@@ -294,6 +301,42 @@ describe('multipart()', function(){
         b: { name: 'b.pdf', path: '/tmp/b.pdf', size: 4 }
       }))
       .end(done)
+    })
+
+    it('attaches a default part.on(error) listener BEFORE invoking the storage engine', function (done) {
+      // The crash being guarded against: multiparty's handlePart doesn't attach a
+      // default part.on('error') the way handleFile does, so if the client aborts
+      // mid-upload (multiparty/index.js handleError → errorEventQueue → eventEmitter
+      // .emit('error', ...)) and the storage engine hasn't attached its own listener,
+      // it's an unhandled 'error' event and the process crashes.
+      //
+      // Assert structurally: by the time the storage engine receives the part, the
+      // wrapper has already installed at least one 'error' listener on it. We
+      // observe this BEFORE the engine attaches anything of its own.
+      var listenerCountWhenStorageCalled = -1
+      var opts = {
+        storage: function (req, part, publicFile, cb) {
+          // INTENTIONALLY no part.on('error') here — we're proving the wrapper
+          // covers engines that forget to add their own.
+          listenerCountWhenStorageCalled = part.listenerCount('error')
+          part.resume()
+          part.on('end', function () {
+            publicFile.path = '/tmp/' + part.filename
+            publicFile.size = 0
+            cb()
+          })
+        }
+      }
+
+      request(createServer(opts))
+      .post('/files')
+      .attach('text', Buffer.from('hi'), 'foo.txt')
+      .expect(200)
+      .end(function (err) {
+        if (err) return done(err)
+        should(listenerCountWhenStorageCalled).be.above(0)
+        done()
+      })
     })
   })
 })

@@ -26,6 +26,11 @@ var typeis = require('type-is');
 
 module.exports = multipart
 
+// Default 'error' listener attached to every part stream in the options.storage path,
+// to prevent unhandled-error crashes if multiparty's handleError fires before the
+// storage engine has attached its own listener. See the call site for details.
+function noopPartError() {}
+
 /**
  * Parse multipart/form-data request bodies, providing the parsed
  * object as `req.body` and `req.files`.
@@ -154,6 +159,18 @@ function multipart (options) {
 
     if (typeof storage === 'function') {
       form.on('part', function(part) {
+        // Multiparty's handleFile attaches its own part.on('error') listener
+        // (multiparty/index.js:696). handlePart — the path we route file parts
+        // through when options.storage is set — does NOT. If the client aborts
+        // mid-upload, multiparty's handleError calls errorEventQueue which
+        // emits 'error' directly on the part stream (multiparty/index.js:645);
+        // an unhandled 'error' event would crash the process. Attach a default
+        // no-op listener BEFORE invoking the storage engine, so even an engine
+        // that forgets to add its own part.on('error') is safe. The form-level
+        // error handler still drives the response — we don't need to do
+        // anything else here.
+        part.on('error', noopPartError);
+
         // Drop any parts that arrive after the request has already finished (either
         // via an error from a previous part's storage callback, or after a successful
         // finishParse). Multiparty keeps parsing buffered parts even after we've
