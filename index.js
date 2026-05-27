@@ -26,6 +26,11 @@ var typeis = require('type-is');
 
 module.exports = multipart
 
+// Default 'error' listener attached to every part stream in the options.storage path,
+// to prevent unhandled-error crashes if multiparty's handleError fires before the
+// storage engine has attached its own listener. See the call site for details.
+function noopPartError() {}
+
 /**
  * Parse multipart/form-data request bodies, providing the parsed
  * object as `req.body` and `req.files`.
@@ -36,6 +41,42 @@ module.exports = multipart
  * dir do the following:
  *
  *     app.use(multipart({ uploadDir: path }))
+ *
+ * ## Custom storage (pre-disk content validation)
+ *
+ * Pass `options.storage` to take over how each file part is persisted. The default
+ * behavior (writing every part to `uploadDir` via multiparty's built-in handler) still
+ * applies when `storage` is omitted, so this is fully backward-compatible.
+ *
+ *     app.use(multipart({
+ *       uploadDir: '/tmp',
+ *       storage: function (req, part, publicFile, cb) {
+ *         // part: a multiparty Part (readable stream)
+ *         // publicFile: pre-populated {fieldName, originalFilename, name, type, headers, size: 0}
+ *         //             — the storage function should fill in publicFile.path and publicFile.size
+ *         //             before calling cb().
+ *         // cb(err) → on err the storage should destroy(part) for resource hygiene
+ *         //          (stop reading the network) and call cb(err). connect-multiparty
+ *         //          then drains the request and surfaces 400 via next(err); it is
+ *         //          form.emit('error') that releases the parser, not destroying the
+ *         //          part stream.
+ *       }
+ *     }))
+ *
+ * Typical implementations buffer the first few KB of `part`, run a magic-byte gate,
+ * and either pipe the rest to disk (no fs.createWriteStream until validation passes)
+ * or destroy(part) and call cb(err). This is the same StorageEngine model multer 1.x
+ * exposes.
+ *
+ * ### Size limit caveat
+ *
+ * `options.maxFilesSize` (default 100 MB) is enforced by multiparty INSIDE its
+ * built-in handleFile via a LimitStream. With `options.storage` set, multiparty
+ * routes file parts to handlePart instead — no LimitStream is inserted. **When you
+ * provide a storage engine, enforcing a per-request/per-file size cap becomes the
+ * storage engine's responsibility** (e.g. via a multer-style `limits.fileSize` or
+ * a counter inside the part 'data' handler). The middleware will not warn if the
+ * cap is silently bypassed.
  *
  * @param {Object} options
  * @return {Function}
@@ -48,6 +89,17 @@ function multipart (options) {
   // multipart request size limit of 100 MiB in Express 3 / connect@2.30.2:
   // https://github.com/senchalabs/connect/blob/2.30.2/lib/middleware/multipart.js#L86
   options.maxFilesSize = options.maxFilesSize || 100 * 1000 * 1000;
+
+  var storage = options.storage;
+
+  // When the caller provides a storage engine, we need multiparty to emit raw 'part'
+  // events instead of running its built-in handleFile that opens a write stream and
+  // pipes immediately. autoFields stays on so text fields still come through as
+  // 'field' events.
+  if (typeof storage === 'function') {
+    options.autoFields = true;
+    options.autoFiles = false;
+  }
 
   return function multipart(req, res, next) {
     if (req._body) return next();
@@ -69,6 +121,12 @@ function multipart (options) {
     var files = {};
     var done = false;
 
+    // Used by the storage path to keep the request open until every per-part storage
+    // callback has resolved. multiparty's 'close' event fires when all part STREAMS
+    // have ended, but our storage may still be flushing bytes to disk after that.
+    var pendingStorage = 0;
+    var partsClosed = false;
+
     function ondata(name, val, data){
       if (Array.isArray(data[name])) {
         data[name].push(val);
@@ -79,15 +137,82 @@ function multipart (options) {
       }
     }
 
+    function finishParse() {
+      if (done) return;
+      done = true;
+      // expand names with qs & assign
+      // Note: `allowDots: false, allowPrototypes: true` come from Express 3 / connect@2.30.2:
+      // https://github.com/senchalabs/connect/blob/2.30.2/lib/middleware/multipart.js#L148-L149
+      req.body = qs.parse(data, { allowDots: false, allowPrototypes: true })
+      /**
+       * Dictionary of field name to FileInfo
+       * @type {{[fieldName: string]: FileInfo}}
+       */
+      req.files = qs.parse(files, { allowDots: false, allowPrototypes: true })
+
+      next()
+    }
+
     form.on('field', function(name, val){
       ondata(name, val, data);
     });
 
-    form.on('file', function(name, val){
-      val.name = val.originalFilename;
-      val.type = val.headers['content-type'] || null;
-      ondata(name, val, files);
-    });
+    if (typeof storage === 'function') {
+      form.on('part', function(part) {
+        // Multiparty's handleFile attaches its own part.on('error') listener
+        // (multiparty/index.js:696). handlePart — the path we route file parts
+        // through when options.storage is set — does NOT. If the client aborts
+        // mid-upload, multiparty's handleError calls errorEventQueue which
+        // emits 'error' directly on the part stream (multiparty/index.js:645);
+        // an unhandled 'error' event would crash the process. Attach a default
+        // no-op listener BEFORE invoking the storage engine, so even an engine
+        // that forgets to add its own part.on('error') is safe. The form-level
+        // error handler still drives the response — we don't need to do
+        // anything else here.
+        part.on('error', noopPartError);
+
+        // Drop any parts that arrive after the request has already finished (either
+        // via an error from a previous part's storage callback, or after a successful
+        // finishParse). Multiparty keeps parsing buffered parts even after we've
+        // signaled completion to express; without this guard we'd kick off new
+        // storage work whose results have nowhere to go.
+        if (done) {
+          part.resume();
+          return;
+        }
+
+        var publicFile = {
+          fieldName: part.name,
+          originalFilename: part.filename,
+          name: part.filename,
+          type: part.headers['content-type'] || null,
+          headers: part.headers,
+          size: 0
+          // `path` is left to the storage engine to fill in once it has chosen one
+          // (typical engines randomize the filename to avoid collisions / traversal).
+        };
+
+        pendingStorage++;
+        storage(req, part, publicFile, function (err) {
+          pendingStorage--;
+          if (err) {
+            // The storage engine should destroy(part) for resource hygiene; it is
+            // form.emit('error') below that actually releases the parser and drives
+            // the 400 response.
+            form.emit('error', err);
+            return;
+          }
+          ondata(part.name, publicFile, files);
+          if (partsClosed && pendingStorage === 0) finishParse();
+        });
+      });
+    } else {
+      form.on('file', function(name, val){
+        val.name = val.originalFilename;
+        val.type = val.headers['content-type'] || null;
+        ondata(name, val, files);
+      });
+    }
 
     form.on('error', function(err){
       if (done) return;
@@ -108,20 +233,11 @@ function multipart (options) {
 
     form.on('close', function() {
       if (done) return;
-
-      done = true;
-
-      // expand names with qs & assign
-      // Note: `allowDots: false, allowPrototypes: true` come from Express 3 / connect@2.30.2:
-      // https://github.com/senchalabs/connect/blob/2.30.2/lib/middleware/multipart.js#L148-L149
-      req.body = qs.parse(data, { allowDots: false, allowPrototypes: true })
-      /**
-       * Dictionary of field name to FileInfo
-       * @type {{[fieldName: string]: FileInfo}}
-       */
-      req.files = qs.parse(files, { allowDots: false, allowPrototypes: true })
-
-      next()
+      partsClosed = true;
+      // With a custom storage engine, wait for any in-flight per-part callbacks to
+      // resolve before finalizing — multiparty's 'close' fires on part-stream end,
+      // not on write-stream finish.
+      if (pendingStorage === 0) finishParse();
     });
 
     form.parse(req);
@@ -136,5 +252,5 @@ function multipart (options) {
  * @property {string} type - content-type of the file, from user's browser
  * @property {number} size - size of the file in bytes
  * @property {string} path - local filesystem path to uploaded file
- * @property {string} fieldName - name of the form field 
+ * @property {string} fieldName - name of the form field
  */

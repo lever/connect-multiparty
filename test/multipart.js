@@ -169,6 +169,176 @@ describe('multipart()', function(){
       .expect(413, done)
     })
   })
+
+  describe('with options.storage', function () {
+    it('passes parts through the storage engine, never opens a write stream by itself', function (done) {
+      var seenFilenames = []
+      var seenChunks = 0
+      var opts = {
+        storage: function (req, part, publicFile, cb) {
+          seenFilenames.push(part.filename)
+          part.on('data', function (chunk) {
+            seenChunks++
+            publicFile.size += chunk.length
+          })
+          part.on('end', function () {
+            publicFile.path = '/dev/null/' + part.filename
+            cb()
+          })
+          part.on('error', function (err) { cb(err) })
+        }
+      }
+
+      request(createServer(opts))
+      .post('/files')
+      .attach('text', Buffer.from('hello storage'), 'foo.txt')
+      .expect(200)
+      .expect(shouldDeepIncludeInBody({
+        text: {
+          fieldName: 'text',
+          originalFilename: 'foo.txt',
+          name: 'foo.txt',
+          path: '/dev/null/foo.txt',
+          size: 13
+        }
+      }))
+      .end(function (err) {
+        if (err) return done(err)
+        should(seenFilenames).eql(['foo.txt'])
+        should(seenChunks).be.above(0)
+        done()
+      })
+    })
+
+    it('rejects the request when the storage engine errors', function (done) {
+      var opts = {
+        storage: function (req, part, publicFile, cb) {
+          // Storage engines should attach part.on('error') for graceful cleanup of
+          // any in-flight write streams or partial state. The wrapper attaches a
+          // no-op default to prevent crashes from forgetful engines, but real
+          // engines want to know.
+          part.on('error', cb)
+          part.resume() // drain so multiparty can finish parsing the boundary
+          part.on('end', function () {
+            cb(new Error('rejected by storage'))
+          })
+        }
+      }
+
+      request(createServer(opts))
+      .post('/files')
+      .attach('text', Buffer.from('whatever'), 'evil.exe')
+      .expect(400)
+      .end(done)
+    })
+
+    it('still routes text fields to req.body alongside file parts', function (done) {
+      var seenStorageFilenames = []
+      var opts = {
+        storage: function (req, part, publicFile, cb) {
+          part.on('error', cb)
+          seenStorageFilenames.push(part.filename)
+          part.resume()
+          part.on('end', function () {
+            publicFile.path = '/tmp/' + part.filename
+            publicFile.size = 0
+            cb()
+          })
+        }
+      }
+
+      // The combined endpoint echoes both body and files so we can assert each.
+      var app = connect()
+        .use(multipart(opts))
+        .use(function (req, res) {
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.end(JSON.stringify({ body: req.body, files: req.files }))
+        })
+        .use(function (err, req, res, next) {
+          res.statusCode = err.statusCode || err.status || 500
+          res.end(err.name + ': ' + err.message)
+        })
+
+      request(app)
+        .post('/combined')
+        .field('user', 'Tobi')
+        .attach('resume', Buffer.from('hello'), 'cv.pdf')
+        .expect(200)
+        .expect(shouldDeepIncludeInBody({
+          body: { user: 'Tobi' },
+          files: { resume: { name: 'cv.pdf', path: '/tmp/cv.pdf' } }
+        }))
+        .end(function (err) {
+          if (err) return done(err)
+          should(seenStorageFilenames).eql(['cv.pdf']) // storage only sees the file part
+          done()
+        })
+    })
+
+    it('waits for async storage callbacks before calling next()', function (done) {
+      var opts = {
+        storage: function (req, part, publicFile, cb) {
+          part.on('error', cb)
+          part.resume()
+          part.on('end', function () {
+            // Simulate a slow flush (write stream finish, S3 upload, etc.)
+            setTimeout(function () {
+              publicFile.path = '/tmp/' + part.filename
+              publicFile.size = 4
+              cb()
+            }, 25)
+          })
+        }
+      }
+
+      request(createServer(opts))
+      .post('/files')
+      .attach('a', Buffer.from('aaaa'), 'a.pdf')
+      .attach('b', Buffer.from('bbbb'), 'b.pdf')
+      .expect(200)
+      .expect(shouldDeepIncludeInBody({
+        a: { name: 'a.pdf', path: '/tmp/a.pdf', size: 4 },
+        b: { name: 'b.pdf', path: '/tmp/b.pdf', size: 4 }
+      }))
+      .end(done)
+    })
+
+    it('attaches a default part.on(error) listener BEFORE invoking the storage engine', function (done) {
+      // The crash being guarded against: multiparty's handlePart doesn't attach a
+      // default part.on('error') the way handleFile does, so if the client aborts
+      // mid-upload (multiparty/index.js handleError → errorEventQueue → eventEmitter
+      // .emit('error', ...)) and the storage engine hasn't attached its own listener,
+      // it's an unhandled 'error' event and the process crashes.
+      //
+      // Assert structurally: by the time the storage engine receives the part, the
+      // wrapper has already installed at least one 'error' listener on it. We
+      // observe this BEFORE the engine attaches anything of its own.
+      var listenerCountWhenStorageCalled = -1
+      var opts = {
+        storage: function (req, part, publicFile, cb) {
+          // INTENTIONALLY no part.on('error') here — we're proving the wrapper
+          // covers engines that forget to add their own.
+          listenerCountWhenStorageCalled = part.listenerCount('error')
+          part.resume()
+          part.on('end', function () {
+            publicFile.path = '/tmp/' + part.filename
+            publicFile.size = 0
+            cb()
+          })
+        }
+      }
+
+      request(createServer(opts))
+      .post('/files')
+      .attach('text', Buffer.from('hi'), 'foo.txt')
+      .expect(200)
+      .end(function (err) {
+        if (err) return done(err)
+        should(listenerCountWhenStorageCalled).be.above(0)
+        done()
+      })
+    })
+  })
 })
 
 function createServer (opts) {
